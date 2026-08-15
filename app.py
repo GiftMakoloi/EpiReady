@@ -1,116 +1,88 @@
 import io
+import re
 import warnings
 from datetime import datetime
+from difflib import SequenceMatcher
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import streamlit as st
 import statsmodels.api as sm
+import streamlit as st
 from sklearn.metrics import roc_auc_score
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 warnings.filterwarnings("ignore")
 
-
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="EpiReady",
-    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-
 # ============================================================
-# CUSTOM CSS
+# STYLE
 # ============================================================
 
 st.markdown(
     """
     <style>
-    .main {
-        padding-top: 1rem;
-    }
-
     .block-container {
-        max-width: 1400px;
+        max-width: 1450px;
         padding-top: 2rem;
     }
 
-    .epiready-title {
+    .title {
         font-size: 3rem;
         font-weight: 700;
         letter-spacing: -1px;
-        margin-bottom: 0.2rem;
     }
 
-    .epiready-subtitle {
+    .subtitle {
         font-size: 1.15rem;
-        color: #666666;
+        color: #666;
         margin-bottom: 2rem;
     }
 
-    .metric-card {
-        border: 1px solid #dddddd;
-        border-radius: 10px;
-        padding: 1rem;
-        background: #ffffff;
-    }
-
-    .status-ready {
-        color: #137333;
-        font-weight: 700;
-    }
-
-    .status-warning {
-        color: #9a6700;
-        font-weight: 700;
-    }
-
-    .status-critical {
-        color: #b42318;
-        font-weight: 700;
-    }
-
-    .section-title {
+    .section {
         font-size: 1.45rem;
         font-weight: 650;
-        margin-top: 1rem;
-        margin-bottom: 0.7rem;
+        margin-top: 1.5rem;
+        margin-bottom: 0.8rem;
     }
 
-    .small-note {
-        font-size: 0.85rem;
-        color: #666666;
+    .reason-box {
+        border: 1px solid #d9d9d9;
+        border-radius: 10px;
+        padding: 1rem;
+        background: #fafafa;
     }
     </style>
     """,
     unsafe_allow_html=True
 )
 
-
 # ============================================================
-# SYNTHETIC DATA GENERATOR
+# SYNTHETIC TB DATA
 # ============================================================
 
 @st.cache_data
-def generate_synthetic_tb_data(n=2500, seed=42):
-
+def generate_synthetic_tb_data(n=1000, seed=42):
     rng = np.random.default_rng(seed)
 
     age = np.clip(
-        rng.normal(42, 17, n),
+        rng.normal(42, 16, n),
         18,
-        90
+        85
     ).round().astype(int)
 
     sex = rng.choice(
         ["Female", "Male"],
-        size=n,
+        n,
         p=[0.55, 0.45]
     )
 
@@ -126,13 +98,13 @@ def generate_synthetic_tb_data(n=2500, seed=42):
             "Free State",
             "Northern Cape"
         ],
-        size=n
+        n
     )
 
-    hiv_probability = (
-        0.15
-        + 0.0025 * age
-        + 0.05 * (sex == "Female")
+    hiv_probability = np.clip(
+        0.12 + 0.0025 * age + 0.05 * (sex == "Female"),
+        0.05,
+        0.60
     )
 
     hiv = np.where(
@@ -148,36 +120,37 @@ def generate_synthetic_tb_data(n=2500, seed=42):
     )
 
     adherence = np.clip(
-        90
-        - 0.25 * age
-        - 10 * (smoking == "Yes")
-        - 8 * (hiv == "Positive")
-        + rng.normal(0, 15, n),
+        88
+        - 0.20 * age
+        - 9 * (smoking == "Yes")
+        - 7 * (hiv == "Positive")
+        + rng.normal(0, 13, n),
         5,
         100
-    )
+    ).round(1)
 
     logit = (
         -3.0
         + 0.025 * age
         + 0.85 * (hiv == "Positive")
-        + 0.75 * (smoking == "Yes")
+        + 0.70 * (smoking == "Yes")
         - 0.035 * adherence
     )
 
     probability = 1 / (1 + np.exp(-logit))
 
-    treatment_failure = np.where(
+    outcome = np.where(
         rng.random(n) < probability,
         "Failure",
         "Success"
     )
 
-    start_dates = pd.to_datetime(
-        "2025-01-01"
-    ) + pd.to_timedelta(
-        rng.integers(0, 365, n),
-        unit="D"
+    start_dates = (
+        pd.Timestamp("2025-01-01")
+        + pd.to_timedelta(
+            rng.integers(0, 365, n),
+            unit="D"
+        )
     )
 
     duration = rng.integers(
@@ -186,9 +159,12 @@ def generate_synthetic_tb_data(n=2500, seed=42):
         n
     )
 
-    end_dates = start_dates + pd.to_timedelta(
-        duration,
-        unit="D"
+    end_dates = (
+        start_dates
+        + pd.to_timedelta(
+            duration,
+            unit="D"
+        )
     )
 
     df = pd.DataFrame({
@@ -198,38 +174,31 @@ def generate_synthetic_tb_data(n=2500, seed=42):
         "province": province,
         "hiv_status": hiv,
         "smoking": smoking,
-        "adherence_percent": adherence.round(1),
-        "treatment_outcome": treatment_failure,
+        "adherence_percent": adherence,
+        "treatment_outcome": outcome,
         "treatment_start": start_dates,
         "treatment_end": end_dates
     })
 
-    # Introduce missingness
-    hiv_missing = rng.random(n) < 0.20
-    smoking_missing = rng.random(n) < 0.10
-    adherence_missing = rng.random(n) < 0.04
+    # Deliberate missingness
+    df.loc[rng.random(n) < 0.18, "hiv_status"] = np.nan
+    df.loc[rng.random(n) < 0.10, "smoking"] = np.nan
+    df.loc[rng.random(n) < 0.05, "adherence_percent"] = np.nan
 
-    df.loc[hiv_missing, "hiv_status"] = np.nan
-    df.loc[smoking_missing, "smoking"] = np.nan
-    df.loc[adherence_missing, "adherence_percent"] = np.nan
-
-    # Introduce a small number of invalid dates
-    invalid_indices = rng.choice(
+    # Deliberate invalid dates
+    bad_idx = rng.choice(
         n,
-        size=max(5, int(n * 0.015)),
+        size=15,
         replace=False
     )
 
     df.loc[
-        invalid_indices,
+        bad_idx,
         "treatment_end"
     ] = (
-        df.loc[
-            invalid_indices,
-            "treatment_start"
-        ]
+        pd.to_datetime(df.loc[bad_idx, "treatment_start"])
         - pd.to_timedelta(
-            rng.integers(1, 60, len(invalid_indices)),
+            rng.integers(1, 45, len(bad_idx)),
             unit="D"
         )
     )
@@ -238,107 +207,471 @@ def generate_synthetic_tb_data(n=2500, seed=42):
 
 
 # ============================================================
-# DATA PROFILING
+# TEXT HELPERS
+# ============================================================
+
+def normalize_text(value):
+    if value is None:
+        return ""
+
+    text = str(value).lower()
+    text = re.sub(r"[^a-z0-9_%\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def similarity(a, b):
+    return SequenceMatcher(
+        None,
+        normalize_text(a),
+        normalize_text(b)
+    ).ratio()
+
+
+# ============================================================
+# RESEARCH QUESTION ENGINE
+# ============================================================
+
+QUESTION_PATTERNS = {
+    "Association": [
+        r"\bassociat",
+        r"\brisk factor",
+        r"\bdetermin",
+        r"\bpredict",
+        r"\bfactors?\b.*\b(outcome|disease|failure|success)\b",
+        r"\brelated to\b",
+    ],
+    "Group comparison": [
+        r"\bdiffer",
+        r"\bcompare",
+        r"\bcomparison",
+        r"\bhigher than\b",
+        r"\blower than\b",
+        r"\bbetween\b.*\bgroups?\b",
+    ],
+    "Survival / time-to-event": [
+        r"\bsurvival\b",
+        r"\btime to\b",
+        r"\btime-to-event\b",
+        r"\bhazard\b",
+        r"\btime until\b",
+        r"\bdeath\b.*\btime\b",
+    ],
+    "Diagnostic accuracy": [
+        r"\bsensitivity\b",
+        r"\bspecificity\b",
+        r"\bdiagnostic accuracy\b",
+        r"\baccurate\b.*\bdiagnos",
+        r"\btest\b.*\bdiagnos",
+    ],
+    "Prevalence / frequency": [
+        r"\bprevalence\b",
+        r"\bproportion\b",
+        r"\bfrequency\b",
+        r"\bhow common\b",
+        r"\bincidence\b",
+    ]
+}
+
+
+def classify_question(question):
+    text = normalize_text(question)
+
+    scores = {}
+
+    for category, patterns in QUESTION_PATTERNS.items():
+
+        score = 0
+
+        for pattern in patterns:
+            if re.search(pattern, text):
+                score += 1
+
+        scores[category] = score
+
+    best_category = max(
+        scores,
+        key=scores.get
+    )
+
+    if scores[best_category] == 0:
+        return {
+            "type": "Unsupported/unclear",
+            "confidence": "Low",
+            "scores": scores
+        }
+
+    if scores[best_category] >= 2:
+        confidence = "High"
+    else:
+        confidence = "Moderate"
+
+    return {
+        "type": best_category,
+        "confidence": confidence,
+        "scores": scores
+    }
+
+
+# ============================================================
+# OUTCOME IDENTIFICATION
+# ============================================================
+
+OUTCOME_KEYWORDS = {
+    "treatment_outcome": [
+        "treatment",
+        "treatment outcome",
+        "treatment failure",
+        "treatment success",
+        "unsuccessful",
+        "success",
+        "failure"
+    ],
+    "mortality": [
+        "mortality",
+        "death",
+        "died",
+        "survival"
+    ],
+    "hiv_status": [
+        "hiv",
+        "hiv status",
+        "positive",
+        "negative"
+    ],
+    "disease_status": [
+        "disease",
+        "disease status",
+        "case",
+        "infected"
+    ]
+}
+
+
+def variable_relevance_score(question, column):
+    text = normalize_text(question)
+    col = normalize_text(column)
+
+    score = 0.0
+
+    if col in text:
+        score += 10
+
+    if col.replace("_", " ") in text:
+        score += 9
+
+    for word in col.replace("_", " ").split():
+
+        if word in text:
+            score += 1
+
+    return score
+
+
+def identify_outcome(df, question):
+
+    text = normalize_text(question)
+    candidates = []
+
+    # First: direct dataset-column matching
+    for column in df.columns:
+
+        score = variable_relevance_score(
+            question,
+            column
+        )
+
+        if score > 0:
+            candidates.append(
+                (column, score, "direct")
+            )
+
+    # Second: semantic keyword matching
+    for column in df.columns:
+
+        column_text = normalize_text(
+            column
+        )
+
+        for key, keywords in OUTCOME_KEYWORDS.items():
+
+            if key == column:
+
+                for keyword in keywords:
+
+                    if keyword in text:
+                        candidates.append(
+                            (column, 6, "semantic")
+                        )
+
+    # Third: special TB inference
+    if "treatment" in text:
+
+        for column in df.columns:
+
+            normalized_col = normalize_text(
+                column
+            )
+
+            if "treatment" in normalized_col:
+
+                candidates.append(
+                    (
+                        column,
+                        8,
+                        "treatment-context"
+                    )
+                )
+
+    if not candidates:
+
+        return {
+            "variable": None,
+            "confidence": "Low",
+            "reason": (
+                "No dataset variable could be reliably "
+                "linked to the outcome language in the question."
+            )
+        }
+
+    # Aggregate by variable
+    aggregated = {}
+
+    for variable, score, source in candidates:
+
+        if variable not in aggregated:
+            aggregated[variable] = {
+                "score": 0,
+                "sources": []
+            }
+
+        aggregated[variable]["score"] += score
+        aggregated[variable]["sources"].append(
+            source
+        )
+
+    ranked = sorted(
+        aggregated.items(),
+        key=lambda x: x[1]["score"],
+        reverse=True
+    )
+
+    variable = ranked[0][0]
+    score = ranked[0][1]["score"]
+
+    confidence = (
+        "High" if score >= 10
+        else "Moderate" if score >= 5
+        else "Low"
+    )
+
+    reason = (
+        f"`{variable}` was selected because its name and/or "
+        "related outcome terms match the wording of the "
+        "research question."
+    )
+
+    return {
+        "variable": variable,
+        "confidence": confidence,
+        "reason": reason
+    }
+
+
+# ============================================================
+# CANDIDATE PREDICTOR IDENTIFICATION
+# ============================================================
+
+def identify_predictors(df, outcome):
+
+    predictors = []
+
+    for column in df.columns:
+
+        if column == outcome:
+            continue
+
+        normalized = normalize_text(
+            column
+        )
+
+        if any(
+            token in normalized
+            for token in [
+                "id",
+                "patient_id",
+                "record_id",
+                "date",
+                "time",
+                "outcome"
+            ]
+        ):
+            continue
+
+        if df[column].nunique(
+            dropna=True
+        ) <= 1:
+            continue
+
+        predictors.append(column)
+
+    return predictors
+
+
+# ============================================================
+# METHOD RECOMMENDATION
+# ============================================================
+
+def recommend_analysis(
+    question_type,
+    df,
+    outcome
+):
+
+    if outcome is None:
+
+        return {
+            "analysis": "Unable to recommend",
+            "reason": (
+                "An outcome variable could not be identified "
+                "with sufficient confidence."
+            )
+        }
+
+    if question_type == "Association":
+
+        unique_count = df[
+            outcome
+        ].dropna().nunique()
+
+        if unique_count == 2:
+
+            return {
+                "analysis": "Logistic regression",
+                "reason": (
+                    f"The question asks about association and "
+                    f"`{outcome}` has two observed outcome categories. "
+                    "Binary logistic regression is therefore a "
+                    "candidate primary method."
+                )
+            }
+
+        if unique_count > 2:
+
+            return {
+                "analysis": "Multinomial or ordinal model",
+                "reason": (
+                    f"`{outcome}` has {unique_count} observed "
+                    "categories. A binary logistic model would "
+                    "not directly match this outcome structure."
+                )
+            }
+
+    if question_type == "Group comparison":
+
+        return {
+            "analysis": "Group comparison",
+            "reason": (
+                "The question appears to compare outcomes "
+                "between groups. The exact statistical test "
+                "depends on the outcome type and distribution."
+            )
+        }
+
+    if question_type == "Survival / time-to-event":
+
+        return {
+            "analysis": "Survival analysis / Cox regression",
+            "reason": (
+                "The question contains time-to-event language. "
+                "A survival-analysis framework is a candidate "
+                "because it can account for follow-up and censoring."
+            )
+        }
+
+    if question_type == "Diagnostic accuracy":
+
+        return {
+            "analysis": "Diagnostic accuracy analysis",
+            "reason": (
+                "The question concerns diagnostic performance. "
+                "Sensitivity, specificity and related 2x2 measures "
+                "are appropriate candidate analyses."
+            )
+        }
+
+    if question_type == "Prevalence / frequency":
+
+        return {
+            "analysis": "Descriptive / prevalence analysis",
+            "reason": (
+                "The question asks about frequency or prevalence. "
+                "A descriptive epidemiological analysis is the "
+                "appropriate starting point."
+            )
+        }
+
+    return {
+        "analysis": "Manual review required",
+        "reason": (
+            "The question could not be mapped to a supported "
+            "analysis type with sufficient confidence."
+        )
+    }
+
+
+# ============================================================
+# DATA QUALITY
 # ============================================================
 
 def profile_dataset(df):
 
-    profile = pd.DataFrame({
-        "Variable": df.columns,
-        "Data Type": [
-            str(dtype)
-            for dtype in df.dtypes
-        ],
-        "Rows": [
-            len(df)
-            for _ in df.columns
-        ],
-        "Missing": [
-            df[col].isna().sum()
-            for col in df.columns
-        ],
-        "Missing %": [
-            round(
-                df[col].isna().mean() * 100,
+    rows = []
+
+    for column in df.columns:
+
+        rows.append({
+            "Variable": column,
+            "Data type": str(df[column].dtype),
+            "Missing": int(df[column].isna().sum()),
+            "Missing %": round(
+                df[column].isna().mean() * 100,
                 2
+            ),
+            "Unique values": int(
+                df[column].nunique(
+                    dropna=True
+                )
             )
-            for col in df.columns
-        ],
-        "Unique Values": [
-            df[col].nunique(dropna=True)
-            for col in df.columns
-        ]
-    })
-
-    return profile
-
-
-# ============================================================
-# MISSING DATA ANALYSIS
-# ============================================================
-
-def missingness_analysis(df):
-
-    records = []
-
-    for col in df.columns:
-
-        missing_count = int(
-            df[col].isna().sum()
-        )
-
-        missing_pct = (
-            missing_count / len(df) * 100
-            if len(df) > 0
-            else 0
-        )
-
-        if missing_pct == 0:
-            status = "Complete"
-        elif missing_pct < 5:
-            status = "Low"
-        elif missing_pct < 20:
-            status = "Moderate"
-        else:
-            status = "High"
-
-        records.append({
-            "Variable": col,
-            "Missing Count": missing_count,
-            "Missing %": round(missing_pct, 2),
-            "Assessment": status
         })
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(rows)
 
-
-# ============================================================
-# DATE CONSISTENCY
-# ============================================================
 
 def date_consistency_check(df):
 
-    result = {
-        "checked": False,
-        "invalid_count": 0,
-        "message": "No treatment date variables detected."
-    }
-
-    start_candidates = [
+    start_cols = [
         c for c in df.columns
-        if "start" in c.lower()
+        if "start" in normalize_text(c)
     ]
 
-    end_candidates = [
+    end_cols = [
         c for c in df.columns
-        if "end" in c.lower()
+        if "end" in normalize_text(c)
     ]
 
-    if not start_candidates or not end_candidates:
-        return result
+    if not start_cols or not end_cols:
 
-    start_col = start_candidates[0]
-    end_col = end_candidates[0]
+        return {
+            "checked": False,
+            "invalid": 0,
+            "start": None,
+            "end": None
+        }
+
+    start_col = start_cols[0]
+    end_col = end_cols[0]
 
     start = pd.to_datetime(
         df[start_col],
@@ -356,175 +689,128 @@ def date_consistency_check(df):
         & (end < start)
     )
 
-    count = int(invalid.sum())
-
-    result["checked"] = True
-    result["invalid_count"] = count
-    result["message"] = (
-        f"{count} records contain an end date "
-        f"before the start date."
-    )
-
-    return result
-
-
-# ============================================================
-# OUTCOME ASSESSMENT
-# ============================================================
-
-def assess_outcome(df, outcome):
-
-    if outcome not in df.columns:
-        return {
-            "status": "Critical",
-            "message": "Selected outcome does not exist."
-        }
-
-    series = df[outcome].dropna()
-
-    if len(series) == 0:
-        return {
-            "status": "Critical",
-            "message": "Outcome contains no usable observations."
-        }
-
-    unique = series.nunique()
-
-    if unique != 2:
-        return {
-            "status": "Warning",
-            "message": (
-                f"Outcome contains {unique} observed categories. "
-                "Binary logistic regression requires two outcome categories."
-            )
-        }
-
-    counts = series.value_counts()
-
-    smallest_pct = (
-        counts.min()
-        / counts.sum()
-        * 100
-    )
-
-    if smallest_pct < 5:
-        return {
-            "status": "Warning",
-            "message": (
-                "One outcome category represents less than 5% "
-                "of observed outcomes. Sparse outcome events may "
-                "affect model stability."
-            )
-        }
-
     return {
-        "status": "Ready",
-        "message": "Binary outcome structure detected."
+        "checked": True,
+        "invalid": int(invalid.sum()),
+        "start": start_col,
+        "end": end_col
     }
 
 
 # ============================================================
-# NUMERICAL CORRELATION
+# MODEL PREPARATION
 # ============================================================
 
-def numerical_correlations(df):
+def make_binary_target(series):
 
-    numeric = df.select_dtypes(
-        include=np.number
-    )
+    values = series.dropna().unique()
 
-    if numeric.shape[1] < 2:
-        return pd.DataFrame()
+    if len(values) != 2:
+        return None, None
 
-    return numeric.corr()
+    values = list(values)
 
+    # Try to put the "negative"/success-like value at 0
+    negative_words = [
+        "success",
+        "successful",
+        "no",
+        "negative",
+        "survived",
+        "alive",
+        "control",
+        "absent"
+    ]
 
-# ============================================================
-# VIF
-# ============================================================
+    first = values[0]
+    second = values[1]
 
-def calculate_vif(df):
+    first_text = normalize_text(first)
+    second_text = normalize_text(second)
 
-    numeric = df.select_dtypes(
-        include=np.number
-    ).copy()
-
-    numeric = numeric.dropna()
-
-    if numeric.shape[1] < 2:
-        return pd.DataFrame()
-
-    numeric = numeric.replace(
-        [np.inf, -np.inf],
-        np.nan
-    ).dropna()
-
-    if len(numeric) < 20:
-        return pd.DataFrame()
-
-    values = numeric.values
-
-    results = []
-
-    for i, column in enumerate(
-        numeric.columns
+    if (
+        any(word in first_text for word in negative_words)
+        and not any(word in second_text for word in negative_words)
     ):
+        zero_value = first
+        one_value = second
 
-        try:
-            vif = variance_inflation_factor(
-                values,
-                i
-            )
-        except Exception:
-            vif = np.nan
+    elif (
+        any(word in second_text for word in negative_words)
+        and not any(word in first_text for word in negative_words)
+    ):
+        zero_value = second
+        one_value = first
 
-        results.append({
-            "Variable": column,
-            "VIF": round(vif, 3)
-        })
+    else:
+        zero_value = first
+        one_value = second
 
-    return pd.DataFrame(results)
+    mapping = {
+        zero_value: 0,
+        one_value: 1
+    }
+
+    return series.map(mapping), mapping
 
 
-# ============================================================
-# LOGISTIC REGRESSION
-# ============================================================
-
-def prepare_logistic_data(
+def prepare_model_data(
     df,
     outcome,
-    predictors
+    predictors,
+    impute=False
 ):
 
     working = df[
         [outcome] + predictors
     ].copy()
 
-    working = working.dropna()
+    if impute:
 
-    y = working[outcome]
+        for column in predictors:
 
-    unique = list(
-        y.dropna().unique()
+            if pd.api.types.is_numeric_dtype(
+                working[column]
+            ):
+
+                working[column] = working[column].fillna(
+                    working[column].median()
+                )
+
+            else:
+
+                mode = working[column].mode(
+                    dropna=True
+                )
+
+                if not mode.empty:
+                    working[column] = working[column].fillna(
+                        mode.iloc[0]
+                    )
+
+    else:
+
+        working = working.dropna()
+
+    y, mapping = make_binary_target(
+        working[outcome]
     )
 
-    if len(unique) != 2:
+    if y is None:
         return None, None, None
-
-    mapping = {
-        unique[0]: 0,
-        unique[1]: 1
-    }
-
-    y = y.map(mapping)
 
     X = working[predictors].copy()
 
     categorical = X.select_dtypes(
-        include=["object", "category", "bool"]
+        include=[
+            "object",
+            "category",
+            "bool"
+        ]
     ).columns.tolist()
 
     if categorical:
+
         X = pd.get_dummies(
             X,
             columns=categorical,
@@ -553,29 +839,50 @@ def prepare_logistic_data(
     return X, y, mapping
 
 
-def run_logistic_regression(
+# ============================================================
+# LOGISTIC MODEL
+# ============================================================
+
+def run_logistic(
     df,
     outcome,
-    predictors
+    predictors,
+    impute=False
 ):
 
     if len(predictors) == 0:
-        return None
+        return {
+            "success": False,
+            "error": "No predictors selected."
+        }
 
-    X, y, mapping = prepare_logistic_data(
+    X, y, mapping = prepare_model_data(
         df,
         outcome,
-        predictors
+        predictors,
+        impute=impute
     )
 
     if X is None:
-        return None
+        return {
+            "success": False,
+            "error": "Outcome is not binary."
+        }
 
-    if len(y) < 50:
-        return None
+    if len(y) < 30:
+        return {
+            "success": False,
+            "error": (
+                "Fewer than 30 usable observations "
+                "remain for the model."
+            )
+        }
 
     if y.nunique() != 2:
-        return None
+        return {
+            "success": False,
+            "error": "The outcome must contain two categories."
+        }
 
     try:
 
@@ -583,18 +890,23 @@ def run_logistic_regression(
             y,
             X
         ).fit(
-            disp=False
+            disp=False,
+            maxiter=200
         )
 
-        params = model.params
         conf = model.conf_int()
 
         results = pd.DataFrame({
-            "Variable": params.index,
-            "Coefficient": params.values,
-            "Odds Ratio": np.exp(params.values),
-            "CI Lower": np.exp(conf[0].values),
-            "CI Upper": np.exp(conf[1].values),
+            "Variable": model.params.index,
+            "Odds Ratio": np.exp(
+                model.params.values
+            ),
+            "CI Lower": np.exp(
+                conf[0].values
+            ),
+            "CI Upper": np.exp(
+                conf[1].values
+            ),
             "P Value": model.pvalues.values
         })
 
@@ -606,264 +918,298 @@ def run_logistic_regression(
         )
 
         return {
+            "success": True,
             "model": model,
             "results": results,
             "n": len(y),
             "events": int(y.sum()),
-            "auc": auc,
+            "auc": float(auc),
             "mapping": mapping
         }
 
     except Exception as exc:
 
         return {
+            "success": False,
             "error": str(exc)
         }
 
 
 # ============================================================
-# READINESS ASSESSMENT
+# VIF
 # ============================================================
 
-def calculate_readiness(
+def calculate_vif(df, predictors):
+
+    if len(predictors) < 2:
+        return pd.DataFrame()
+
+    X = df[
+        predictors
+    ].copy()
+
+    categorical = X.select_dtypes(
+        include=[
+            "object",
+            "category",
+            "bool"
+        ]
+    ).columns.tolist()
+
+    if categorical:
+
+        X = pd.get_dummies(
+            X,
+            columns=categorical,
+            drop_first=True,
+            dtype=float
+        )
+
+    X = X.select_dtypes(
+        include=np.number
+    )
+
+    X = X.replace(
+        [np.inf, -np.inf],
+        np.nan
+    ).dropna()
+
+    if X.shape[1] < 2 or len(X) < 30:
+        return pd.DataFrame()
+
+    rows = []
+
+    for i, column in enumerate(
+        X.columns
+    ):
+
+        try:
+            vif = variance_inflation_factor(
+                X.values,
+                i
+            )
+        except Exception:
+            vif = np.nan
+
+        rows.append({
+            "Variable": column,
+            "VIF": round(
+                float(vif),
+                3
+            ) if np.isfinite(vif) else np.nan
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# READINESS ENGINE
+# ============================================================
+
+def assess_readiness(
     df,
     outcome,
     analysis,
-    date_result
+    predictors,
+    date_info
 ):
 
     score = 100
-
     findings = []
 
-    missing = df.isna().mean() * 100
-
-    high_missing = missing[
-        missing >= 20
-    ]
-
-    moderate_missing = missing[
-        (missing >= 5)
-        & (missing < 20)
-    ]
-
-    if len(high_missing) > 0:
-
-        score -= min(
-            25,
-            len(high_missing) * 8
-        )
+    # Outcome
+    if outcome is None:
+        score -= 30
 
         findings.append({
-            "severity": "Critical",
-            "domain": "Missingness",
-            "finding": (
-                f"{len(high_missing)} variable(s) have "
-                "at least 20% missing observations."
+            "Severity": "Critical",
+            "Domain": "Outcome",
+            "Finding": (
+                "No outcome variable was reliably identified."
             )
         })
 
-    elif len(moderate_missing) > 0:
+    else:
 
-        score -= min(
-            15,
-            len(moderate_missing) * 3
+        unique = df[
+            outcome
+        ].dropna().nunique()
+
+        if unique == 2:
+
+            counts = df[
+                outcome
+            ].value_counts(
+                dropna=True
+            )
+
+            smallest = (
+                counts.min()
+                / counts.sum()
+                * 100
+            )
+
+            if smallest < 5:
+
+                score -= 10
+
+                findings.append({
+                    "Severity": "Warning",
+                    "Domain": "Outcome",
+                    "Finding": (
+                        "The smallest outcome category is below "
+                        "5% of observed outcomes."
+                    )
+                })
+
+            else:
+
+                findings.append({
+                    "Severity": "Pass",
+                    "Domain": "Outcome",
+                    "Finding": (
+                        "Binary outcome detected with both "
+                        "categories represented."
+                    )
+                })
+
+        else:
+
+            score -= 20
+
+            findings.append({
+                "Severity": "Warning",
+                "Domain": "Outcome",
+                "Finding": (
+                    f"Outcome contains {unique} observed categories."
+                )
+            })
+
+    # Missingness
+    for column in df.columns:
+
+        missing_pct = (
+            df[column].isna().mean()
+            * 100
         )
 
-        findings.append({
-            "severity": "Warning",
-            "domain": "Missingness",
-            "finding": (
-                f"{len(moderate_missing)} variable(s) have "
-                "5–20% missing observations."
-            )
-        })
+        if missing_pct >= 20:
 
-    if date_result["invalid_count"] > 0:
+            score -= 5
+
+            findings.append({
+                "Severity": "Critical",
+                "Domain": "Missingness",
+                "Finding": (
+                    f"{column} has {missing_pct:.1f}% missing values."
+                )
+            })
+
+        elif missing_pct >= 5:
+
+            score -= 2
+
+            findings.append({
+                "Severity": "Warning",
+                "Domain": "Missingness",
+                "Finding": (
+                    f"{column} has {missing_pct:.1f}% missing values."
+                )
+            })
+
+    # Dates
+    if date_info["checked"]:
+
+        if date_info["invalid"] > 0:
+
+            score -= 10
+
+            findings.append({
+                "Severity": "Critical",
+                "Domain": "Temporal consistency",
+                "Finding": (
+                    f"{date_info['invalid']} records have an "
+                    "end date earlier than the start date."
+                )
+            })
+
+        else:
+
+            findings.append({
+                "Severity": "Pass",
+                "Domain": "Temporal consistency",
+                "Finding": (
+                    "No invalid start/end date sequences detected."
+                )
+            })
+
+    # Predictors
+    if not predictors:
 
         score -= 15
 
         findings.append({
-            "severity": "Critical",
-            "domain": "Temporal consistency",
-            "finding": date_result["message"]
+            "Severity": "Critical",
+            "Domain": "Predictors",
+            "Finding": (
+                "No candidate predictor variables are available."
+            )
         })
 
-    outcome_result = assess_outcome(
+    # VIF
+    vif = calculate_vif(
         df,
-        outcome
+        predictors
     )
 
-    if outcome_result["status"] == "Critical":
+    if not vif.empty:
 
-        score -= 25
+        high_vif = vif[
+            vif["VIF"] >= 5
+        ]
 
-        findings.append({
-            "severity": "Critical",
-            "domain": "Outcome",
-            "finding": outcome_result["message"]
-        })
+        if not high_vif.empty:
 
-    elif outcome_result["status"] == "Warning":
-
-        score -= 10
-
-        findings.append({
-            "severity": "Warning",
-            "domain": "Outcome",
-            "finding": outcome_result["message"]
-        })
-
-    if analysis == "Logistic regression":
-
-        if outcome_result["status"] == "Ready":
+            score -= 8
 
             findings.append({
-                "severity": "Information",
-                "domain": "Model suitability",
-                "finding": (
-                    "Binary outcome structure is compatible "
-                    "with logistic regression."
+                "Severity": "Warning",
+                "Domain": "Predictor dependence",
+                "Finding": (
+                    "At least one predictor has VIF >= 5. "
+                    "Review potential multicollinearity."
+                )
+            })
+
+        else:
+
+            findings.append({
+                "Severity": "Pass",
+                "Domain": "Predictor dependence",
+                "Finding": (
+                    "No predictor with VIF >= 5 was detected "
+                    "in the available numerical representation."
                 )
             })
 
     score = max(
         0,
-        min(100, int(score))
+        min(
+            100,
+            int(score)
+        )
     )
 
     if score >= 80:
-        status = "Ready"
+        status = "Ready for preliminary analysis"
     elif score >= 60:
         status = "Proceed with caution"
     else:
-        status = "Not ready"
+        status = "Not analysis-ready"
 
-    return score, status, findings
-
-
-# ============================================================
-# REPORT GENERATION
-# ============================================================
-
-def generate_report(
-    df,
-    research_question,
-    analysis,
-    outcome,
-    score,
-    status,
-    findings
-):
-
-    lines = []
-
-    lines.append(
-        "EpiReady Analysis Readiness Report"
+    return score, status, pd.DataFrame(
+        findings
     )
-
-    lines.append("=" * 50)
-    lines.append("")
-
-    lines.append(
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "Research question:"
-    )
-
-    lines.append(
-        research_question
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"Planned analysis: {analysis}"
-    )
-
-    lines.append(
-        f"Outcome: {outcome}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        f"Analysis readiness score: {score}/100"
-    )
-
-    lines.append(
-        f"Assessment: {status}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "Dataset:"
-    )
-
-    lines.append(
-        f"Rows: {len(df)}"
-    )
-
-    lines.append(
-        f"Columns: {len(df.columns)}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "Findings:"
-    )
-
-    for finding in findings:
-
-        lines.append(
-            f"[{finding['severity']}] "
-            f"{finding['domain']}: "
-            f"{finding['finding']}"
-        )
-
-    lines.append("")
-
-    lines.append(
-        "Interpretation:"
-    )
-
-    lines.append(
-        "This assessment is an analytical decision-support "
-        "prototype. It does not establish causal relationships "
-        "and does not replace epidemiological or biostatistical "
-        "judgment."
-    )
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    '<div class="epiready-title">EpiReady</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="epiready-subtitle">'
-    'Epidemiological Analysis Readiness Engine'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-st.write(
-    "Assess whether a health dataset is suitable for the "
-    "specific epidemiological question and statistical "
-    "analysis you intend to perform."
-)
 
 
 # ============================================================
@@ -871,10 +1217,14 @@ st.write(
 # ============================================================
 
 st.sidebar.header(
-    "Project Configuration"
+    "EpiReady"
 )
 
-data_source = st.sidebar.radio(
+st.sidebar.caption(
+    "Epidemiological Analysis Readiness Engine"
+)
+
+source = st.sidebar.radio(
     "Data source",
     [
         "Synthetic TB dataset",
@@ -882,210 +1232,105 @@ data_source = st.sidebar.radio(
     ]
 )
 
-if data_source == "Synthetic TB dataset":
+if source == "Synthetic TB dataset":
 
-    n = st.sidebar.slider(
-        "Synthetic sample size",
-        min_value=500,
-        max_value=10000,
-        value=2500,
-        step=500
-    )
-
-    seed = st.sidebar.number_input(
-        "Random seed",
-        min_value=1,
-        value=42
-    )
-
-    df = generate_synthetic_tb_data(
-        n=n,
-        seed=seed
-    )
+    df = generate_synthetic_tb_data()
 
 else:
 
     uploaded = st.sidebar.file_uploader(
-        "Upload CSV dataset",
+        "Upload CSV",
         type=["csv"]
     )
 
     if uploaded is None:
 
         st.info(
-            "Upload a CSV dataset or select the synthetic "
-            "TB dataset from the sidebar."
+            "Upload a CSV dataset to begin."
         )
 
         st.stop()
 
     try:
-
-        df = pd.read_csv(
-            uploaded
-        )
+        df = pd.read_csv(uploaded)
 
     except Exception as exc:
 
         st.error(
-            f"Unable to read CSV: {exc}"
+            f"Unable to read the uploaded CSV: {exc}"
         )
 
         st.stop()
 
 
 # ============================================================
-# RESEARCH QUESTION
-# ============================================================
-
-st.sidebar.header(
-    "Research Question"
-)
-
-research_question = st.sidebar.text_area(
-    "Define the epidemiological question",
-    value=(
-        "What factors are associated with "
-        "unsuccessful TB treatment?"
-    )
-)
-
-analysis = st.sidebar.selectbox(
-    "Planned statistical analysis",
-    [
-        "Logistic regression",
-        "Descriptive analysis",
-        "Survival analysis",
-        "Diagnostic test analysis",
-        "Count outcome analysis"
-    ]
-)
-
-
-# ============================================================
-# VARIABLE SELECTION
-# ============================================================
-
-st.sidebar.header(
-    "Analysis Variables"
-)
-
-columns = df.columns.tolist()
-
-default_outcome = (
-    "treatment_outcome"
-    if "treatment_outcome" in columns
-    else columns[0]
-)
-
-outcome = st.sidebar.selectbox(
-    "Outcome variable",
-    columns,
-    index=columns.index(
-        default_outcome
-    )
-)
-
-candidate_predictors = [
-    c for c in columns
-    if c != outcome
-]
-
-predictors = st.sidebar.multiselect(
-    "Potential predictors",
-    candidate_predictors,
-    default=[
-        c for c in [
-            "age",
-            "sex",
-            "hiv_status",
-            "smoking",
-            "adherence_percent"
-        ]
-        if c in candidate_predictors
-    ]
-)
-
-
-# ============================================================
-# DATE CHECK
-# ============================================================
-
-date_result = date_consistency_check(
-    df
-)
-
-
-# ============================================================
-# READINESS
-# ============================================================
-
-score, status, findings = calculate_readiness(
-    df,
-    outcome,
-    analysis,
-    date_result
-)
-
-
-# ============================================================
-# TOP METRICS
+# TITLE
 # ============================================================
 
 st.markdown(
-    '<div class="section-title">Analysis Readiness</div>',
+    '<div class="title">EpiReady</div>',
     unsafe_allow_html=True
 )
 
-m1, m2, m3, m4 = st.columns(4)
+st.markdown(
+    '<div class="subtitle">'
+    'Epidemiological Analysis Readiness Engine'
+    '</div>',
+    unsafe_allow_html=True
+)
 
-with m1:
-    st.metric(
-        "Readiness Score",
-        f"{score}/100"
-    )
-
-with m2:
-    st.metric(
-        "Observations",
-        f"{len(df):,}"
-    )
-
-with m3:
-    st.metric(
-        "Variables",
-        f"{len(df.columns)}"
-    )
-
-with m4:
-    missing_total = int(
-        df.isna().sum().sum()
-    )
-
-    st.metric(
-        "Missing Cells",
-        f"{missing_total:,}"
-    )
+st.write(
+    "Define an epidemiological question, let EpiReady interpret "
+    "the question, verify the interpretation against your dataset, "
+    "and evaluate whether the proposed analysis is supported by "
+    "the available data."
+)
 
 
-if status == "Ready":
+# ============================================================
+# QUESTION INPUT
+# ============================================================
 
-    st.success(
-        "Assessment: Ready for the selected preliminary workflow."
-    )
+st.markdown(
+    '<div class="section">1. Define the research question</div>',
+    unsafe_allow_html=True
+)
 
-elif status == "Proceed with caution":
+question = st.text_area(
+    "Research question",
+    value=(
+        "What factors are associated with unsuccessful "
+        "TB treatment among patients receiving TB treatment?"
+    ),
+    height=110
+)
 
-    st.warning(
-        "Assessment: Proceed with caution. Important analytical issues require investigation."
-    )
 
-else:
+# ============================================================
+# QUESTION INTERPRETATION
+# ============================================================
 
-    st.error(
-        "Assessment: Not ready. Critical issues require attention before analysis."
-    )
+question_result = classify_question(
+    question
+)
 
+outcome_result = identify_outcome(
+    df,
+    question
+)
+
+identified_outcome = outcome_result["variable"]
+
+predictors = identify_predictors(
+    df,
+    identified_outcome
+) if identified_outcome else []
+
+recommendation = recommend_analysis(
+    question_result["type"],
+    df,
+    identified_outcome
+)
 
 # ============================================================
 # TABS
@@ -1093,215 +1338,352 @@ else:
 
 tabs = st.tabs(
     [
-        "Overview",
-        "Data Quality",
-        "Epidemiological Risks",
+        "Question Interpretation",
+        "Dataset Verification",
+        "Analysis Readiness",
         "Statistical Analysis",
         "Sensitivity",
         "Report"
     ]
 )
 
-
 # ============================================================
-# OVERVIEW
+# QUESTION INTERPRETATION TAB
 # ============================================================
 
 with tabs[0]:
 
     st.markdown(
-        '<div class="section-title">Research Definition</div>',
+        '<div class="section">Question Interpretation</div>',
         unsafe_allow_html=True
     )
 
-    st.write(
-        research_question
-    )
-
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
 
     with c1:
-
-        st.write(
-            "**Planned analysis**"
-        )
-
-        st.write(
-            analysis
+        st.metric(
+            "Question type",
+            question_result["type"]
         )
 
     with c2:
-
-        st.write(
-            "**Outcome**"
+        st.metric(
+            "Interpretation confidence",
+            question_result["confidence"]
         )
 
-        st.write(
-            outcome
+    with c3:
+
+        st.metric(
+            "Detected outcome",
+            identified_outcome
+            if identified_outcome
+            else "Not identified"
         )
 
     st.markdown(
-        '<div class="section-title">Dataset Preview</div>',
+        '<div class="section">What EpiReady detected</div>',
         unsafe_allow_html=True
     )
 
-    st.dataframe(
-        df.head(20),
-        use_container_width=True
+    interpretation_table = pd.DataFrame(
+        [
+            {
+                "Component": "Research question",
+                "EpiReady interpretation": question
+            },
+            {
+                "Component": "Question type",
+                "EpiReady interpretation": question_result["type"]
+            },
+            {
+                "Component": "Outcome variable",
+                "EpiReady interpretation": (
+                    identified_outcome
+                    if identified_outcome
+                    else "Not identified"
+                )
+            },
+            {
+                "Component": "Outcome confidence",
+                "EpiReady interpretation": outcome_result["confidence"]
+            },
+            {
+                "Component": "Candidate predictors",
+                "EpiReady interpretation": (
+                    ", ".join(predictors)
+                    if predictors
+                    else "None identified"
+                )
+            },
+            {
+                "Component": "Recommended analysis",
+                "EpiReady interpretation": recommendation["analysis"]
+            }
+        ]
     )
+
+    st.dataframe(
+        interpretation_table,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown(
+        '<div class="section">Why?</div>',
+        unsafe_allow_html=True
+    )
+
+    st.info(
+        outcome_result["reason"]
+    )
+
+    st.info(
+        recommendation["reason"]
+    )
+
+    with st.expander(
+        "Show the rule-based interpretation logic"
+    ):
+
+        st.write(
+            "EpiReady does not invent a statistical interpretation "
+            "using an opaque model. The prototype uses explicit "
+            "pattern-matching and dataset-validation rules."
+        )
+
+        st.write(
+            "Question classification rules:"
+        )
+
+        for category, patterns in QUESTION_PATTERNS.items():
+
+            st.write(
+                f"{category}: "
+                + ", ".join(patterns)
+            )
 
 
 # ============================================================
-# DATA QUALITY
+# DATASET VERIFICATION
 # ============================================================
 
 with tabs[1]:
 
     st.markdown(
-        '<div class="section-title">Dataset Profile</div>',
+        '<div class="section">Dataset Verification</div>',
         unsafe_allow_html=True
     )
 
-    profile = profile_dataset(
-        df
+    st.write(
+        "EpiReady now verifies whether the variables it identified "
+        "actually exist in the uploaded dataset."
     )
 
-    st.dataframe(
-        profile,
-        use_container_width=True
-    )
+    verification_rows = []
+
+    if identified_outcome:
+
+        verification_rows.append({
+            "Component": "Outcome",
+            "Variable": identified_outcome,
+            "Exists in dataset": (
+                "Yes"
+                if identified_outcome in df.columns
+                else "No"
+            ),
+            "Observed categories": (
+                ", ".join(
+                    map(
+                        str,
+                        df[
+                            identified_outcome
+                        ]
+                        .dropna()
+                        .unique()
+                    )
+                )
+                if identified_outcome in df.columns
+                else "N/A"
+            )
+        })
+
+    for predictor in predictors:
+
+        verification_rows.append({
+            "Component": "Predictor",
+            "Variable": predictor,
+            "Exists in dataset": "Yes",
+            "Observed categories": (
+                f"{df[predictor].nunique(dropna=True)} unique"
+            )
+        })
+
+    if verification_rows:
+
+        st.dataframe(
+            pd.DataFrame(
+                verification_rows
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    else:
+
+        st.warning(
+            "EpiReady could not identify variables from the question."
+        )
 
     st.markdown(
-        '<div class="section-title">Missingness</div>',
+        '<div class="section">Dataset profile</div>',
         unsafe_allow_html=True
     )
 
-    missing = missingness_analysis(
-        df
-    )
-
     st.dataframe(
-        missing,
-        use_container_width=True
+        profile_dataset(df),
+        use_container_width=True,
+        hide_index=True
     )
 
-    missing_plot = missing[
-        missing["Missing %"] > 0
+    missing = (
+        df.isna()
+        .mean()
+        .mul(100)
+        .sort_values(
+            ascending=False
+        )
+        .reset_index()
+    )
+
+    missing.columns = [
+        "Variable",
+        "Missing %"
     ]
 
-    if not missing_plot.empty:
+    fig = px.bar(
+        missing,
+        x="Variable",
+        y="Missing %",
+        title="Missingness by Variable"
+    )
 
-        fig = px.bar(
-            missing_plot,
-            x="Variable",
-            y="Missing %",
-            title="Missingness by Variable"
-        )
+    fig.update_layout(
+        xaxis_tickangle=-45
+    )
 
-        fig.update_layout(
-            xaxis_tickangle=-45
-        )
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+
+# ============================================================
+# READINESS
+# ============================================================
+
+date_info = date_consistency_check(
+    df
+)
+
+readiness_score, readiness_status, findings_df = assess_readiness(
+    df,
+    identified_outcome,
+    recommendation["analysis"],
+    predictors,
+    date_info
+)
+
+with tabs[2]:
 
     st.markdown(
-        '<div class="section-title">Temporal Consistency</div>',
+        '<div class="section">Analysis Readiness</div>',
         unsafe_allow_html=True
     )
 
-    if date_result["checked"]:
+    c1, c2, c3, c4 = st.columns(4)
 
-        if date_result["invalid_count"] == 0:
+    with c1:
+
+        st.metric(
+            "Readiness",
+            f"{readiness_score}/100"
+        )
+
+    with c2:
+
+        st.metric(
+            "Rows",
+            f"{len(df):,}"
+        )
+
+    with c3:
+
+        st.metric(
+            "Variables",
+            f"{len(df.columns)}"
+        )
+
+    with c4:
+
+        st.metric(
+            "Predictors identified",
+            len(predictors)
+        )
+
+    if readiness_score >= 80:
+
+        st.success(
+            readiness_status
+        )
+
+    elif readiness_score >= 60:
+
+        st.warning(
+            readiness_status
+        )
+
+    else:
+
+        st.error(
+            readiness_status
+        )
+
+    st.markdown(
+        '<div class="section">Evidence</div>',
+        unsafe_allow_html=True
+    )
+
+    st.dataframe(
+        findings_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.markdown(
+        '<div class="section">Temporal consistency</div>',
+        unsafe_allow_html=True
+    )
+
+    if date_info["checked"]:
+
+        if date_info["invalid"] == 0:
 
             st.success(
-                "No invalid treatment date sequences were detected."
+                "No invalid start/end date sequences detected."
             )
 
         else:
 
             st.error(
-                date_result["message"]
+                f"{date_info['invalid']} records have an "
+                "end date earlier than their start date."
             )
 
     else:
 
         st.info(
-            date_result["message"]
-        )
-
-
-# ============================================================
-# EPIDEMIOLOGICAL RISKS
-# ============================================================
-
-with tabs[2]:
-
-    st.markdown(
-        '<div class="section-title">Risk Findings</div>',
-        unsafe_allow_html=True
-    )
-
-    if not findings:
-
-        st.success(
-            "No major automated findings were detected."
-        )
-
-    else:
-
-        findings_df = pd.DataFrame(
-            findings
-        )
-
-        st.dataframe(
-            findings_df,
-            use_container_width=True
-        )
-
-    st.markdown(
-        '<div class="section-title">Outcome Assessment</div>',
-        unsafe_allow_html=True
-    )
-
-    outcome_result = assess_outcome(
-        df,
-        outcome
-    )
-
-    st.write(
-        f"Status: {outcome_result['status']}"
-    )
-
-    st.write(
-        outcome_result["message"]
-    )
-
-    if outcome in df.columns:
-
-        counts = (
-            df[outcome]
-            .value_counts(dropna=False)
-            .reset_index()
-        )
-
-        counts.columns = [
-            "Outcome",
-            "Count"
-        ]
-
-        fig = px.bar(
-            counts,
-            x="Outcome",
-            y="Count",
-            title="Outcome Distribution"
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
+            "No start/end date pair was automatically identified."
         )
 
 
@@ -1312,79 +1694,159 @@ with tabs[2]:
 with tabs[3]:
 
     st.markdown(
-        '<div class="section-title">Statistical Diagnostics</div>',
+        '<div class="section">Statistical Analysis</div>',
         unsafe_allow_html=True
     )
 
-    numeric = df.select_dtypes(
-        include=np.number
-    )
+    if recommendation[
+        "analysis"
+    ] == "Logistic regression":
 
-    if numeric.shape[1] >= 2:
-
-        correlation = numerical_correlations(
-            df
+        st.write(
+            "EpiReady has identified binary logistic regression "
+            "as a candidate primary analysis."
         )
 
         st.write(
-            "Numerical variable correlation matrix"
+            f"Outcome: `{identified_outcome}`"
         )
 
-        st.dataframe(
-            correlation.round(3),
-            use_container_width=True
+        st.write(
+            "Predictors:"
         )
 
-        fig = px.imshow(
-            correlation,
-            text_auto=True,
-            title="Numerical Correlation Matrix"
+        st.write(
+            ", ".join(predictors)
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+        if identified_outcome:
 
-    else:
-
-        st.info(
-            "At least two numerical variables are required "
-            "for correlation diagnostics."
-        )
-
-    st.markdown(
-        '<div class="section-title">Variance Inflation Diagnostics</div>',
-        unsafe_allow_html=True
-    )
-
-    vif = calculate_vif(
-        df
-    )
-
-    if vif.empty:
-
-        st.info(
-            "Insufficient numerical data for VIF calculation."
-        )
-
-    else:
-
-        st.dataframe(
-            vif,
-            use_container_width=True
-        )
-
-        high_vif = vif[
-            vif["VIF"] >= 5
-        ]
-
-        if len(high_vif) > 0:
-
-            st.warning(
-                "One or more numerical variables have VIF values "
-                "of at least 5. Investigate potential predictor dependence."
+            outcome_values = (
+                df[
+                    identified_outcome
+                ]
+                .dropna()
+                .value_counts()
             )
+
+            st.markdown(
+                '<div class="section">Outcome distribution</div>',
+                unsafe_allow_html=True
+            )
+
+            outcome_table = outcome_values.reset_index()
+
+            outcome_table.columns = [
+                "Outcome",
+                "Count"
+            ]
+
+            st.dataframe(
+                outcome_table,
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.markdown(
+            '<div class="section">Complete-case model</div>',
+            unsafe_allow_html=True
+        )
+
+        model_result = run_logistic(
+            df,
+            identified_outcome,
+            predictors,
+            impute=False
+        )
+
+        if not model_result["success"]:
+
+            st.error(
+                model_result["error"]
+            )
+
+        else:
+
+            st.write(
+                f"Usable observations: {model_result['n']:,}"
+            )
+
+            st.write(
+                f"Events coded as 1: {model_result['events']:,}"
+            )
+
+            st.write(
+                f"Model AUC: {model_result['auc']:.3f}"
+            )
+
+            result_table = model_result[
+                "results"
+            ].copy()
+
+            result_table = result_table[
+                result_table["Variable"] != "const"
+            ]
+
+            st.dataframe(
+                result_table.round(4),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "Odds ratios and confidence intervals above are "
+                "calculated from the uploaded dataset using "
+                "statsmodels."
+            )
+
+        st.markdown(
+            '<div class="section">Multicollinearity screening</div>',
+            unsafe_allow_html=True
+        )
+
+        vif = calculate_vif(
+            df,
+            predictors
+        )
+
+        if vif.empty:
+
+            st.info(
+                "Insufficient compatible numerical data for VIF."
+            )
+
+        else:
+
+            st.dataframe(
+                vif,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            if (vif["VIF"] >= 5).any():
+
+                st.warning(
+                    "At least one represented predictor has VIF >= 5. "
+                    "This is a diagnostic warning, not automatic evidence "
+                    "that a variable should be removed."
+                )
+
+            else:
+
+                st.success(
+                    "No represented predictor has VIF >= 5."
+                )
+
+    else:
+
+        st.info(
+            f"The rule-based engine recommends: "
+            f"{recommendation['analysis']}"
+        )
+
+        st.write(
+            recommendation["reason"]
+        )
 
 
 # ============================================================
@@ -1394,73 +1856,91 @@ with tabs[3]:
 with tabs[4]:
 
     st.markdown(
-        '<div class="section-title">Sensitivity Analysis</div>',
+        '<div class="section">Sensitivity Analysis</div>',
         unsafe_allow_html=True
     )
 
-    if analysis != "Logistic regression":
+    if recommendation[
+        "analysis"
+    ] != "Logistic regression":
 
         st.info(
-            "The current MVP sensitivity workflow is implemented "
-            "for logistic regression."
-        )
-
-    elif len(predictors) == 0:
-
-        st.warning(
-            "Select at least one predictor."
+            "The current prototype's automated sensitivity "
+            "workflow is implemented for logistic regression."
         )
 
     else:
 
-        result = run_logistic_regression(
+        complete_case = run_logistic(
             df,
-            outcome,
-            predictors
+            identified_outcome,
+            predictors,
+            impute=False
         )
 
-        if result is None:
+        simple_imputation = run_logistic(
+            df,
+            identified_outcome,
+            predictors,
+            impute=True
+        )
 
-            st.error(
-                "The selected variables could not be used for "
-                "the logistic regression."
+        if (
+            complete_case["success"]
+            and simple_imputation["success"]
+        ):
+
+            cc = complete_case["results"].copy()
+            si = simple_imputation["results"].copy()
+
+            cc = cc[
+                cc["Variable"] != "const"
+            ][
+                ["Variable", "Odds Ratio"]
+            ]
+
+            si = si[
+                si["Variable"] != "const"
+            ][
+                ["Variable", "Odds Ratio"]
+            ]
+
+            comparison = cc.merge(
+                si,
+                on="Variable",
+                how="outer",
+                suffixes=(
+                    "_CompleteCase",
+                    "_SimpleImputation"
+                )
             )
 
-        elif "error" in result:
+            comparison["Absolute difference"] = (
+                comparison[
+                    "Odds Ratio_SimpleImputation"
+                ]
+                - comparison[
+                    "Odds Ratio_CompleteCase"
+                ]
+            ).abs()
 
-            st.error(
-                f"Model fitting failed: {result['error']}"
+            st.dataframe(
+                comparison.round(4),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption(
+                "The sensitivity model uses simple median/mode "
+                "imputation and is included as a transparent prototype. "
+                "It is not a substitute for a rigorously specified "
+                "multiple-imputation analysis."
             )
 
         else:
 
-            st.write(
-                f"Complete-case observations: {result['n']:,}"
-            )
-
-            st.write(
-                f"Observed events: {result['events']:,}"
-            )
-
-            st.write(
-                f"Model AUC: {result['auc']:.3f}"
-            )
-
-            model_results = result["results"].copy()
-
-            model_results = model_results[
-                model_results["Variable"] != "const"
-            ]
-
-            st.dataframe(
-                model_results.round(4),
-                use_container_width=True
-            )
-
-            st.caption(
-                "This MVP uses complete-case analysis for the primary model. "
-                "The absence of a statistically significant result should "
-                "not be interpreted as evidence of no association."
+            st.warning(
+                "A sensitivity comparison could not be completed."
             )
 
 
@@ -1471,28 +1951,76 @@ with tabs[4]:
 with tabs[5]:
 
     st.markdown(
-        '<div class="section-title">Analysis Readiness Report</div>',
+        '<div class="section">Auditable Report</div>',
         unsafe_allow_html=True
     )
 
-    report = generate_report(
-        df=df,
-        research_question=research_question,
-        analysis=analysis,
-        outcome=outcome,
-        score=score,
-        status=status,
-        findings=findings
+    report_lines = [
+        "EPIREADY ANALYSIS READINESS REPORT",
+        "=" * 60,
+        "",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "RESEARCH QUESTION",
+        question,
+        "",
+        "QUESTION TYPE",
+        question_result["type"],
+        f"Confidence: {question_result['confidence']}",
+        "",
+        "DETECTED OUTCOME",
+        str(identified_outcome),
+        f"Confidence: {outcome_result['confidence']}",
+        "",
+        "CANDIDATE PREDICTORS",
+        ", ".join(predictors),
+        "",
+        "RECOMMENDED ANALYSIS",
+        recommendation["analysis"],
+        "",
+        "WHY",
+        recommendation["reason"],
+        "",
+        "READINESS",
+        f"{readiness_score}/100",
+        readiness_status,
+        "",
+        "FINDINGS"
+    ]
+
+    for _, row in findings_df.iterrows():
+
+        report_lines.append(
+            f"[{row['Severity']}] "
+            f"{row['Domain']}: "
+            f"{row['Finding']}"
+        )
+
+    report_lines.extend([
+        "",
+        "IMPORTANT LIMITATIONS",
+        "This prototype uses explicit rule-based question "
+        "interpretation and statistical diagnostics.",
+        "The question interpreter supports a defined set of "
+        "epidemiological question patterns and should not be "
+        "treated as general natural-language understanding.",
+        "Automated findings do not establish causal relationships.",
+        "The readiness assessment is a decision-support mechanism "
+        "and not a validated clinical or regulatory score.",
+    ])
+
+    report = "\n".join(
+        report_lines
     )
 
     st.text_area(
         "Report",
         report,
-        height=450
+        height=650
     )
 
     st.download_button(
-        label="Download Readiness Report",
+        "Download EpiReady Report",
         data=report,
         file_name="epiready_analysis_readiness_report.txt",
         mime="text/plain"
@@ -1506,12 +2034,7 @@ with tabs[5]:
 st.divider()
 
 st.caption(
-    "EpiReady is a research software prototype. Automated "
-    "assessments are intended to support, not replace, "
-    "epidemiological and biostatistical judgment."
-)
-
-st.caption(
-    "Developed by Gift Makoloi | DevOps Engineer | "
-    "Software Engineer | AI Product Manager | Digital Social Scientist"
+    "EpiReady is a research software prototype designed to "
+    "support transparent epidemiological and biostatistical "
+    "reasoning. Automated outputs require human review."
 )
